@@ -1,9 +1,8 @@
-.env,
-hugg.js,
-node_modules,
-package-lock.json,
-test.js,
-tool.js,
-agent.js,
-index.js,
+.env
+hugg.js
+node_modules
+package-lock.json
+tool.js
+agent.js
+index.js
 server.js
