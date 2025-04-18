@@ -34,8 +34,25 @@ class ClickElement extends Tool {
   async call(input) {
     const { selector } = this.schema.parse(input);
     console.log('Clicking element:', input);
-    await this.page.waitForSelector(selector, { timeout: 5000 });
-    await this.page.click(selector);
+    let navigationPromise = null;
+    try {
+      await this.page.waitForSelector(selector, { timeout: 5000 });
+      navigationPromise = this.page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 7000 }).catch(() => {});
+      await this.page.click(selector);
+    } catch (err) {
+      console.warn(`Selector '${selector}' not found. Fallback: simulating Enter key in search input.`);
+      // Try to focus the search input and press Enter
+      try {
+        navigationPromise = this.page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 7000 }).catch(() => {});
+        await this.page.focus("input[name='q']");
+        await this.page.keyboard.press('Enter');
+      } catch (e2) {
+        throw new Error(`Click and Enter fallback failed: ${e2.message}`);
+      }
+    }
+    if (navigationPromise) {
+      await navigationPromise;
+    }
     return await this.page.content();
   }
 }
@@ -75,8 +92,26 @@ class ExtractText extends Tool {
   async call(input) {
     const { selector } = this.schema.parse(input);
     console.log('Extracting text from:', input);
-    const text = await this.page.$eval(selector, (el) => el.textContent.trim());
-    return text;
+    const selectorsToTry = [
+      selector,
+      ".result__title a",
+      ".react-results--main .react-results__title a",
+      "a[data-testid='result-title-a']",
+      "h2 a"
+    ];
+    let lastError = null;
+    for (const sel of selectorsToTry) {
+      try {
+        await this.page.waitForSelector(sel, { timeout: 4000 });
+        const text = await this.page.$eval(sel, el => el.textContent.trim());
+        console.log(`Extracted text using selector: ${sel}`);
+        return text;
+      } catch (err) {
+        console.warn(`Failed to extract with selector '${sel}': ${err.message}`);
+        lastError = err;
+      }
+    }
+    throw new Error(`All selectors failed for DuckDuckGo result title. Last error: ${lastError && lastError.message}`);
   }
 }
 
