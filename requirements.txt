@@ -1,0 +1,5 @@
+# Add to your requirements.txt if not already present
+puppeteer
+zod
+node-fetch
+dotenv
