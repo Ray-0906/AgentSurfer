@@ -51,6 +51,10 @@ function extractIndexFromTask(task) {
 }
 
 async function extractInfoNode(context) {
+  // Helper: check if task is a 'summarize content after opening result' task
+  function isOpenAndSummarizeTask(task) {
+    return /open the \d+(?:st|nd|rd|th)? result.*summary|summarize|return.*content/i.test(task);
+  }
   const { page, log, actionsTaken, llm } = context;
   try {
     log('Extract Information Node: Fetching page content...');
@@ -191,6 +195,49 @@ async function extractInfoNode(context) {
     // Parse extraction index from task
     const extractionIndex = extractIndexFromTask(context.task);
     log('Extraction index parsed from task:', extractionIndex);
+
+    // If the task is to open the Nth result and summarize its content
+    if (isOpenAndSummarizeTask(context.task)) {
+      if (candidateSelectors.length <= extractionIndex) {
+        return { ...context, finalResult: `Extraction failed: Not enough results to open the ${extractionIndex+1}th result.`, nextNode: 'endNode' };
+      }
+      const nthCandidate = candidateSelectors[extractionIndex];
+      log('Navigating to the Nth result:', nthCandidate.text, nthCandidate.selector, nthCandidate.index);
+      // Extract href
+      let href = await page.evaluate((sel, idx) => {
+        const els = Array.from(document.querySelectorAll(sel));
+        if (els.length > idx) return els[idx].href;
+        return null;
+      }, nthCandidate.selector, nthCandidate.index);
+      if (!href) {
+        return { ...context, finalResult: `Extraction failed: Could not find href for the ${extractionIndex+1}th result.`, nextNode: 'endNode' };
+      }
+      log('Navigating to URL:', href);
+      await page.goto(href, { waitUntil: 'domcontentloaded', timeout: 20000 });
+      // Extract main content (try to get article, main, or body text)
+      let content = await page.evaluate(() => {
+        function getTextFromSelectors(selectors) {
+          for (const sel of selectors) {
+            const el = document.querySelector(sel);
+            if (el && el.innerText && el.innerText.length > 200) return el.innerText;
+          }
+          return '';
+        }
+        // Try main, article, then body
+        let text = getTextFromSelectors(['main', 'article']);
+        if (!text) text = document.body ? document.body.innerText : '';
+        return text;
+      });
+      if (!content || content.length < 100) {
+        return { ...context, finalResult: 'Extraction failed: Could not extract enough content from the article.', nextNode: 'endNode' };
+      }
+      log('Extracted article content, length:', content.length);
+      // Summarize with LLM
+      const summaryPrompt = `Summarize the following web article in 5-7 sentences. Focus on the main topic and key points.\n\n${content.slice(0, 6000)}`;
+      const summaryResult = await llm.invoke([{ role: 'user', content: summaryPrompt }]);
+      log('Summary generated.');
+      return { ...context, finalResult: summaryResult.content, nextNode: 'endNode' };
+    }
 
     // Ask LLM to pick the best selector for the Nth result (second, if requested)
     const whichResult = /second/i.test(context.task) ? 'second' : 'first';
@@ -568,7 +615,7 @@ const nodeMap = {
 
   // Central context object
   const context = {
-    task: "Go to duckduckgo.com, search for 'Heavenly Demon', and extract the 5th result title.",
+    task: "Go to duckduckgo.com, search for 'Heavenly Demon', open the 5th result, and return a summary of its content.",
     page,
     actionsTaken: [],
     tools,
