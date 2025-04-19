@@ -55,6 +55,22 @@ async function extractInfoNode(context) {
   function isOpenAndSummarizeTask(task) {
     return /open the \d+(?:st|nd|rd|th)? result.*summary|summarize|return.*content/i.test(task);
   }
+  // For 'open first result whose URL contains ...' pattern
+  function isOpenFirstResultByUrlKeywordTask(task) {
+    return /open the first result whose url contains ['\"]?(\w+)['\"]?/i.test(task);
+  }
+  function getUrlKeywordFromTask(task) {
+    const m = /open the first result whose url contains ['\"]?(\w+)['\"]?/i.exec(task);
+    return m ? m[1] : null;
+  }
+  // For 'open the first 5 results, find the one with the most text content, and return a summary' pattern
+  function isOpenFirstNMostContentTask(task) {
+    return /open the first (\d+) results?, find the one with the most text content, and return a summary/i.test(task);
+  }
+  function getOpenFirstNFromTask(task) {
+    const m = /open the first (\d+) results?/i.exec(task);
+    return m ? parseInt(m[1], 10) : 5;
+  }
   const { page, log, actionsTaken, llm } = context;
   try {
     log('Extract Information Node: Fetching page content...');
@@ -196,6 +212,108 @@ async function extractInfoNode(context) {
     const extractionIndex = extractIndexFromTask(context.task);
     log('Extraction index parsed from task:', extractionIndex);
 
+    // If the task is to open the first N results, find the one with the most text content, and summarize
+    if (isOpenFirstNMostContentTask(context.task)) {
+      const N = getOpenFirstNFromTask(context.task);
+      log(`Opening the first ${N} results, extracting content, and finding the one with the most text.`);
+      // Collect all URLs and titles first
+      let resultInfos = [];
+      for (let i = 0; i < Math.min(N, candidateSelectors.length); ++i) {
+        const candidate = candidateSelectors[i];
+        let href = await page.evaluate((sel, idx) => {
+          const els = Array.from(document.querySelectorAll(sel));
+          if (els.length > idx) return els[idx].href;
+          return null;
+        }, candidate.selector, candidate.index);
+        if (href) {
+          resultInfos.push({href, title: candidate.text});
+        }
+      }
+      if (resultInfos.length === 0) {
+        return { ...context, finalResult: 'Extraction failed: No valid result URLs found.', nextNode: 'endNode' };
+      }
+      let maxContent = '', maxHref = '', maxTitle = '';
+      for (let i = 0; i < resultInfos.length; ++i) {
+        const {href, title} = resultInfos[i];
+        log(`Navigating to result #${i+1}: ${title} ${href}`);
+        try {
+          await page.goto(href, { waitUntil: 'domcontentloaded', timeout: 20000 });
+          let content = await page.evaluate(() => {
+            function getTextFromSelectors(selectors) {
+              for (const sel of selectors) {
+                const el = document.querySelector(sel);
+                if (el && el.innerText && el.innerText.length > 200) return el.innerText;
+              }
+              return '';
+            }
+            let text = getTextFromSelectors(['main', 'article']);
+            if (!text) text = document.body ? document.body.innerText : '';
+            return text;
+          });
+          log(`Extracted content length for result #${i+1}: ${content.length}`);
+          if (content.length > maxContent.length) {
+            maxContent = content;
+            maxHref = href;
+            maxTitle = title;
+          }
+        } catch (err) {
+          log(`Failed to extract content from result #${i+1}: ${err}`);
+        }
+      }
+      if (!maxContent || maxContent.length < 100) {
+        return { ...context, finalResult: 'Extraction failed: Could not extract enough content from any of the articles.', nextNode: 'endNode' };
+      }
+      log(`Longest content found at: ${maxHref} (length: ${maxContent.length})`);
+      const summaryPrompt = `Summarize the following web article in 5-7 sentences. Focus on the main topic and key points.\n\n${maxContent.slice(0, 6000)}`;
+      const summaryResult = await llm.invoke([{ role: 'user', content: summaryPrompt }]);
+      log('Summary generated.');
+      return { ...context, finalResult: summaryResult.content, nextNode: 'endNode' };
+    }
+    // If the task is to open the first result whose URL contains a keyword and summarize
+    if (isOpenFirstResultByUrlKeywordTask(context.task)) {
+      const keyword = getUrlKeywordFromTask(context.task);
+      log('Looking for first result whose URL contains:', keyword);
+      let foundIdx = -1, foundHref = null, foundText = null;
+      for (let i = 0; i < candidateSelectors.length; ++i) {
+        const href = await page.evaluate((sel, idx) => {
+          const els = Array.from(document.querySelectorAll(sel));
+          if (els.length > idx) return els[idx].href;
+          return null;
+        }, candidateSelectors[i].selector, candidateSelectors[i].index);
+        if (href && href.includes(keyword)) {
+          foundIdx = i;
+          foundHref = href;
+          foundText = candidateSelectors[i].text;
+          break;
+        }
+      }
+      if (foundIdx === -1) {
+        return { ...context, finalResult: `Extraction failed: No result URL contains '${keyword}'.`, nextNode: 'endNode' };
+      }
+      log('Navigating to first result with keyword:', foundText, foundHref);
+      await page.goto(foundHref, { waitUntil: 'domcontentloaded', timeout: 20000 });
+      // Extract main content
+      let content = await page.evaluate(() => {
+        function getTextFromSelectors(selectors) {
+          for (const sel of selectors) {
+            const el = document.querySelector(sel);
+            if (el && el.innerText && el.innerText.length > 200) return el.innerText;
+          }
+          return '';
+        }
+        let text = getTextFromSelectors(['main', 'article']);
+        if (!text) text = document.body ? document.body.innerText : '';
+        return text;
+      });
+      if (!content || content.length < 100) {
+        return { ...context, finalResult: 'Extraction failed: Could not extract enough content from the article.', nextNode: 'endNode' };
+      }
+      log('Extracted article content, length:', content.length);
+      const summaryPrompt = `Summarize the following web article in 5-7 sentences. Focus on the main topic and key points.\n\n${content.slice(0, 6000)}`;
+      const summaryResult = await llm.invoke([{ role: 'user', content: summaryPrompt }]);
+      log('Summary generated.');
+      return { ...context, finalResult: summaryResult.content, nextNode: 'endNode' };
+    }
     // If the task is to open the Nth result and summarize its content
     if (isOpenAndSummarizeTask(context.task)) {
       if (candidateSelectors.length <= extractionIndex) {
@@ -615,7 +733,7 @@ const nodeMap = {
 
   // Central context object
   const context = {
-    task: "Go to duckduckgo.com, search for 'Heavenly Demon', open the 5th result, and return a summary of its content.",
+    task: "Go to duckduckgo.com, search for 'Heavenly Demon', open the first 5 results, find the one with the most text content, and return a summary of that article.",
     page,
     actionsTaken: [],
     tools,
