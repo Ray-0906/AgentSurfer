@@ -115,6 +115,98 @@ class ExtractText extends Tool {
   }
 }
 
+// ---- Modular utility functions ----
+/**
+ * Summarize text using the provided LLM.
+ * @param {object} llm - The LLM instance
+ * @param {string} text - The text to summarize
+ * @param {object} [options] - Optional config (prompt, length, etc)
+ * @returns {Promise<string>} The summary
+ */
+export async function summarizeText(llm, text, options = {}) {
+  const prompt = options.prompt || `Summarize the following in 5-7 sentences. Focus on the main topic and key points.\n\n${text.slice(0, 6000)}`;
+  const result = await llm.invoke([{ role: 'user', content: prompt }]);
+  return result.content;
+}
+
+/**
+ * Extract main readable content from a Puppeteer page
+ * @param {object} page - Puppeteer page instance
+ * @returns {Promise<string>} Main content text
+ */
+export async function extractMainContent(page) {
+  return await page.evaluate(() => {
+    function getTextFromSelectors(selectors) {
+      for (const sel of selectors) {
+        const el = document.querySelector(sel);
+        if (el && el.innerText && el.innerText.length > 200) return el.innerText;
+      }
+      return '';
+    }
+    let text = getTextFromSelectors(['main', 'article']);
+    if (!text) text = document.body ? document.body.innerText : '';
+    return text;
+  });
+}
+
+/**
+ * Filter an array of result objects by a URL substring
+ * @param {Array<{href: string}>} results
+ * @param {string} keyword
+ * @returns {Array}
+ */
+export function filterResultsByUrl(results, keyword) {
+  return results.filter(r => r.href && r.href.includes(keyword));
+}
+
+/**
+ * Get the nth result object (0-based)
+ * @param {Array} results
+ * @param {number} n
+ * @returns {object|null}
+ */
+export function extractNthResult(results, n) {
+  return (results && results.length > n) ? results[n] : null;
+}
+
+/**
+ * Extract all hrefs from a selector
+ * @param {object} page - Puppeteer page
+ * @param {string} selector
+ * @returns {Promise<string[]>}
+ */
+export async function extractAllLinks(page, selector) {
+  return await page.evaluate(sel => Array.from(document.querySelectorAll(sel)).map(a => a.href), selector);
+}
+
+/**
+ * Extract all snippets/descriptions from a selector
+ * @param {object} page
+ * @param {string} selector
+ * @returns {Promise<string[]>}
+ */
+export async function extractSnippets(page, selector) {
+  return await page.evaluate(sel => Array.from(document.querySelectorAll(sel)).map(e => e.innerText || ''), selector);
+}
+
+/**
+ * Get all visible text from the page (excluding scripts/styles)
+ * @param {object} page
+ * @returns {Promise<string>}
+ */
+export async function getVisibleText(page) {
+  return await page.evaluate(() => {
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
+    let node, text = '';
+    while ((node = walker.nextNode())) {
+      if (node.parentElement && getComputedStyle(node.parentElement).display !== 'none') {
+        text += node.textContent + ' ';
+      }
+    }
+    return text.replace(/\s+/g, ' ').trim();
+  });
+}
+
 export function createTools(page) {
   return [
     new NavigateToUrl(page),
