@@ -36,6 +36,20 @@ function extractQueryFromTask(task) {
   return match ? match[1] : 'AI agents';
 }
 
+function extractIndexFromTask(task) {
+  // Match e.g. '8th', '3rd', '2nd', '10th', etc.
+  const match = task.match(/extract the (\d+)(?:st|nd|rd|th)? result/i);
+  if (match) return parseInt(match[1], 10) - 1;
+  // Match e.g. 'first', 'second', ...
+  const words = ["first","second","third","fourth","fifth","sixth","seventh","eighth","ninth","tenth"];
+  const matchWord = task.match(/extract the (\w+) result/i);
+  if (matchWord) {
+    const idx = words.indexOf(matchWord[1].toLowerCase());
+    if (idx !== -1) return idx;
+  }
+  return 0;
+}
+
 async function extractInfoNode(context) {
   const { page, log, actionsTaken, llm } = context;
   try {
@@ -174,6 +188,10 @@ async function extractInfoNode(context) {
 
     log('Candidate selectors for extraction:', candidateSelectors);
 
+    // Parse extraction index from task
+    const extractionIndex = extractIndexFromTask(context.task);
+    log('Extraction index parsed from task:', extractionIndex);
+
     // Ask LLM to pick the best selector for the Nth result (second, if requested)
     const whichResult = /second/i.test(context.task) ? 'second' : 'first';
     const llmPrompt = `You are a web agent. Here are candidate elements for the ${whichResult} search result title on DuckDuckGo:\n\n${candidateSelectors.map((c, i) => `#${i+1}\nSelector: ${c.selector} [index ${c.index}]\nText: ${c.text}\nHTML: ${c.outerHTML.slice(0, 120)}...`).join('\n\n')}\n\nWhich selector and index best matches the ${whichResult} result title? Reply with the selector string and index, e.g. ".result__title a", 1`;
@@ -188,7 +206,8 @@ async function extractInfoNode(context) {
     }
     log('LLM-chosen selector for extraction:', selector, 'index:', index);
 
-    return { ...context, pageContent: content, extractionSelector: selector, extractionIndex: index, candidateSelectors, nextNode: 'extractWithSelectorNode' };
+    return { ...context, pageContent: content, extractionSelector: selector, extractionIndex: extractionIndex, candidateSelectors, nextNode: 'extractWithSelectorNode' };
+
   } catch (e) {
     context.error = e;
     return { ...context, nextNode: 'errorHandlingNode' };
@@ -223,33 +242,54 @@ async function extractWithSelectorNode(context) {
   // 2. Fallback: Try candidateSelectors by index (robust for arbitrary sites)
   log('LLM-chosen selector failed or empty. Attempting fallback with candidateSelectors...');
   log('candidateSelectors.length:', candidateSelectors.length);
-  if (!candidateSelectors || candidateSelectors.length === 0) {
-    log('WARNING: candidateSelectors is empty!');
-  }
-  for (const fallback of candidateSelectors) {
-    log(`Evaluating candidateSelector: [${fallback.selector}][${fallback.index}]`);
-    if (fallback.selector === extractionSelector && fallback.index === extractionIndex) {
-      log('Skipping candidateSelector because it matches LLM-chosen selector.');
-      continue;
-    }
-    log(`Trying candidateSelector: [${fallback.selector}][${fallback.index}]`);
-    try {
-      await page.waitForSelector(fallback.selector, { timeout: 2000 });
-      const elements = await page.$$(fallback.selector);
-      if (elements.length > fallback.index) {
-        const el = elements[fallback.index];
-        const text = await page.evaluate(el => el.textContent.trim(), el);
-        if (text && text.length > 0) {
-          log(`Extracted text (candidateSelectors fallback): [${fallback.selector}][${fallback.index}]`, text);
-          return { ...context, finalResult: text, nextNode: 'endNode' };
+  if (candidateSelectors && candidateSelectors.length > 0) {
+    let mainTried = false;
+    // 1. Try the extractionIndex-th candidate first (if in range)
+    if (typeof extractionIndex === 'number' && extractionIndex >= 0 && extractionIndex < candidateSelectors.length) {
+      const fallback = candidateSelectors[extractionIndex];
+      if (!tried.has(fallback.selector + fallback.index)) {
+        tried.add(fallback.selector + fallback.index);
+        try {
+          await page.waitForSelector(fallback.selector, { timeout: 2000 });
+          const elements = await page.$$(fallback.selector);
+          if (elements.length > fallback.index) {
+            const el = elements[fallback.index];
+            const text = await page.evaluate(el => el.textContent.trim(), el);
+            if (text && text.length > 0) {
+              log(`Extracted text (candidateSelectors fallback, extractionIndex): [${fallback.selector}][${fallback.index}]`, text);
+              return { ...context, finalResult: text, nextNode: 'endNode' };
+            }
+          }
+        } catch (err) {
+          log('Fallback extraction failed for extractionIndex candidate', fallback.selector, `[${fallback.index}]:`, err.message);
+          lastError = err;
         }
+        mainTried = true;
       }
-    } catch (err) {
-      log('Fallback extraction failed for', fallback.selector, `[${fallback.index}]:`, err.message);
-      lastError = err;
+    }
+    // 2. Try all other candidates (except the one already tried)
+    for (let i = 0; i < candidateSelectors.length; ++i) {
+      if (mainTried && i === extractionIndex) continue;
+      const fallback = candidateSelectors[i];
+      if (tried.has(fallback.selector + fallback.index)) continue;
+      tried.add(fallback.selector + fallback.index);
+      try {
+        await page.waitForSelector(fallback.selector, { timeout: 2000 });
+        const elements = await page.$$(fallback.selector);
+        if (elements.length > fallback.index) {
+          const el = elements[fallback.index];
+          const text = await page.evaluate(el => el.textContent.trim(), el);
+          if (text && text.length > 0) {
+            log(`Extracted text (candidateSelectors fallback): [${fallback.selector}][${fallback.index}]`, text);
+            return { ...context, finalResult: text, nextNode: 'endNode' };
+          }
+        }
+      } catch (err) {
+        log('Fallback extraction failed for', fallback.selector, `[${fallback.index}]:`, err.message);
+        lastError = err;
+      }
     }
   }
-
   // 3. If all else fails
   return { ...context, finalResult: `Extraction failed: ${lastError ? lastError.message : 'No candidates matched.'}`, nextNode: 'endNode' };
 }
@@ -528,7 +568,7 @@ const nodeMap = {
 
   // Central context object
   const context = {
-    task: "Go to duckduckgo.com, search for 'Heavenly Demon', and extract the 8th result title.",
+    task: "Go to duckduckgo.com, search for 'Heavenly Demon', and extract the 5th result title.",
     page,
     actionsTaken: [],
     tools,
